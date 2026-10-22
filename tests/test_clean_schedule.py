@@ -1,5 +1,7 @@
 import copy
 import datetime
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -93,6 +95,25 @@ class RulesTests(unittest.TestCase):
     def test_cancel_requires_date(self) -> None:
         with self.assertRaisesRegex(clean_schedule.RulesValidationError, "date is required"):
             clean_schedule.validate_rules({"cancel": [{"match": "Test"}]})
+
+    def test_rejects_unknown_fields_in_matching_rules(self) -> None:
+        cases = {
+            "drop": {"match": "Test", "starttime": "14:00"},
+            "cancel": {"date": "2026-10-14", "mach": "Test"},
+            "override": {"date": "2026-10-14", "end_time": "15:00", "titel": "Test"},
+        }
+        for section, rule in cases.items():
+            with (
+                self.subTest(section=section),
+                self.assertRaisesRegex(clean_schedule.RulesValidationError, "unknown field"),
+            ):
+                clean_schedule.validate_rules({section: [rule]})
+
+    def test_missing_rules_file_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "rules.yaml"
+            with self.assertRaisesRegex(clean_schedule.RulesValidationError, "does not exist"):
+                clean_schedule.load_rules(missing)
 
     def test_rejects_duplicate_generated_custom_uid(self) -> None:
         item = {
@@ -221,6 +242,20 @@ class CalendarTests(unittest.TestCase):
             parsed = Calendar.from_ical(output.read_bytes())
             self.assertEqual(str(parsed["version"]), "2.0")
 
+    @unittest.skipIf(os.name == "nt", "POSIX file modes are not available on Windows")
+    def test_atomic_write_preserves_existing_file_mode(self) -> None:
+        calendar = Calendar()
+        calendar.add("prodid", "-//test//EN")
+        calendar.add("version", "2.0")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "calendar.ics"
+            output.write_bytes(b"old")
+            output.chmod(0o644)
+
+            clean_schedule.write_calendar_atomic(calendar, output)
+
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o644)
+
 
 class HistoryTests(unittest.TestCase):
     @staticmethod
@@ -268,6 +303,42 @@ class HistoryTests(unittest.TestCase):
         start = clean_schedule.determine_semester_start(current, previous, now=now)
 
         self.assertEqual(start.date().isoformat(), "2027-02-20")
+
+    def test_selects_longest_qualifying_summer_break(self) -> None:
+        now = datetime.datetime(2027, 3, 10, 12, 0, tzinfo=WARSAW)
+        previous = self.calendar_with(
+            self.event("winter@example.test", datetime.datetime(2027, 1, 20, tzinfo=WARSAW))
+        )
+        current = self.calendar_with(
+            self.event("early-1@example.test", datetime.datetime(2027, 2, 5, tzinfo=WARSAW)),
+            self.event("early-2@example.test", datetime.datetime(2027, 2, 7, tzinfo=WARSAW)),
+            self.event("early-3@example.test", datetime.datetime(2027, 2, 9, tzinfo=WARSAW)),
+            self.event("late-1@example.test", datetime.datetime(2027, 3, 1, tzinfo=WARSAW)),
+            self.event("late-2@example.test", datetime.datetime(2027, 3, 3, tzinfo=WARSAW)),
+            self.event("late-3@example.test", datetime.datetime(2027, 3, 5, tzinfo=WARSAW)),
+        )
+
+        start = clean_schedule.determine_semester_start(current, previous, now=now)
+
+        self.assertEqual(start.date().isoformat(), "2027-03-01")
+
+    def test_selects_later_break_when_qualifying_breaks_have_equal_length(self) -> None:
+        now = datetime.datetime(2027, 3, 5, 12, 0, tzinfo=WARSAW)
+        previous = self.calendar_with(
+            self.event("winter@example.test", datetime.datetime(2027, 1, 20, tzinfo=WARSAW))
+        )
+        current = self.calendar_with(
+            self.event("early-1@example.test", datetime.datetime(2027, 2, 5, tzinfo=WARSAW)),
+            self.event("early-2@example.test", datetime.datetime(2027, 2, 7, tzinfo=WARSAW)),
+            self.event("early-3@example.test", datetime.datetime(2027, 2, 9, tzinfo=WARSAW)),
+            self.event("late-1@example.test", datetime.datetime(2027, 2, 25, tzinfo=WARSAW)),
+            self.event("late-2@example.test", datetime.datetime(2027, 2, 27, tzinfo=WARSAW)),
+            self.event("late-3@example.test", datetime.datetime(2027, 3, 1, tzinfo=WARSAW)),
+        )
+
+        start = clean_schedule.determine_semester_start(current, previous, now=now)
+
+        self.assertEqual(start.date().isoformat(), "2027-02-25")
 
     def test_uses_hard_march_boundary_when_break_is_not_detected(self) -> None:
         start = clean_schedule.determine_semester_start(

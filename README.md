@@ -43,7 +43,8 @@ MIN_SEMESTER_BREAK_DAYS="14"
 
 Copy `rules.example.yaml` to `rules.yaml`, then customize the new file. The `.env`,
 `rules.yaml`, and all `.ics` files are ignored by Git. Never publish the access key
-contained in the USOS URL or your private schedule rules.
+contained in the USOS URL or your private schedule rules. A missing rules file stops
+the refresh so the application never publishes an accidentally unfiltered calendar.
 
 ### Keeping rules in a private repository
 
@@ -85,10 +86,11 @@ from the current semester. Older events are removed automatically. The state fil
 the public calendar are both replaced atomically.
 
 The winter semester always starts on October 1. For the summer semester, the program
-looks for a break of at least `MIN_SEMESTER_BREAK_DAYS` between USOS events, beginning
-at `SUMMER_BREAK_SEARCH_START`. It accepts the first day after a qualifying break only
-when regular activity follows, ignoring custom events during detection. The detected
-date is stored inside the private history calendar and reused on subsequent runs.
+looks for breaks of at least `MIN_SEMESTER_BREAK_DAYS` between USOS events, beginning
+at `SUMMER_BREAK_SEARCH_START`. It selects the longest qualifying break only when
+regular activity follows, ignoring custom events during detection. If multiple breaks
+have the same length, the later one wins. The detected date is stored inside the
+private history calendar and reused on subsequent runs.
 
 If no reliable break is detected by `SUMMER_SEMESTER_HARD_START`, that date becomes the
 semester boundary. The defaults search from January 20, require a 14-day break, and

@@ -3,6 +3,7 @@ import datetime
 import itertools
 import os
 import re
+import stat
 import tempfile
 import uuid
 import zoneinfo
@@ -35,6 +36,11 @@ TIME_FORMAT = "%H:%M"
 DATE_FORMAT = "%Y-%m-%d"
 RULE_LIST_SECTIONS = {"drop", "cancel", "override", "custom"}
 RULE_SECTIONS = RULE_LIST_SECTIONS | {"templates"}
+RULE_FIELDS = {
+    "drop": {"match", "date", "start_time"},
+    "cancel": {"match", "date", "start_time"},
+    "override": {"match", "date", "filter_start_time", "start_time", "end_time"},
+}
 CUSTOM_EVENT_FIELDS = {
     "title",
     "description",
@@ -159,6 +165,12 @@ def validate_rules(rules: object) -> dict:
                     _require_non_empty_text(item, "uid", context)
                 continue
 
+            unknown_fields = set(item) - RULE_FIELDS[section]
+            if unknown_fields:
+                raise RulesValidationError(
+                    f"{context} has unknown field(s): {', '.join(sorted(unknown_fields))}."
+                )
+
             selector_time = "filter_start_time" if section == "override" else "start_time"
             if not item.get("match") and not item.get("date") and not item.get(selector_time):
                 raise RulesValidationError(f"{context} needs at least one matching condition.")
@@ -202,9 +214,8 @@ def validate_rules(rules: object) -> dict:
 def load_rules(filepath: str | Path) -> dict:
     """Load and validate configuration rules from a YAML file."""
     path = Path(filepath)
-    if not path.exists():
-        print(f"Warning: Rules file '{path}' not found. Skipping rule processing.")
-        return {}
+    if not path.is_file():
+        raise RulesValidationError(f"Rules file '{path}' does not exist or is not a file.")
     try:
         with path.open("r", encoding="utf-8") as handle:
             return validate_rules(yaml.safe_load(handle))
@@ -547,7 +558,7 @@ def determine_semester_start(
             candidates.append((gap_days, after))
 
     if candidates:
-        detected_start = max(candidates)[1]
+        detected_start = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))[1]
         return datetime.datetime.combine(detected_start, datetime.time.min, LOCAL_TIMEZONE)
     if now_local.date() >= hard_date:
         return datetime.datetime.combine(hard_date, datetime.time.min, LOCAL_TIMEZONE)
@@ -630,6 +641,10 @@ def write_calendar_atomic(calendar: Calendar, output_path: str | Path) -> None:
     """Atomically replace the output so readers never see a partial ICS file."""
     output_file = Path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing_mode = stat.S_IMODE(output_file.stat().st_mode)
+    except FileNotFoundError:
+        existing_mode = None
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -639,6 +654,8 @@ def write_calendar_atomic(calendar: Calendar, output_path: str | Path) -> None:
             handle.write(calendar.to_ical())
             handle.flush()
             os.fsync(handle.fileno())
+        if existing_mode is not None:
+            temporary_path.chmod(existing_mode)
         os.replace(temporary_path, output_file)
     finally:
         if temporary_path is not None and temporary_path.exists():
