@@ -1,0 +1,73 @@
+# Calendar transformation rules
+#
+# Copy this file to rules.yaml and adjust it to your schedule.
+# Dates use YYYY-MM-DD. Times use local Europe/Warsaw time in HH:MM format.
+# Event title matching is a case-insensitive substring match.
+# Supported top-level sections: templates, drop, cancel, override, custom.
+
+# Reusable defaults for custom events. A template may contain any custom-event field:
+# title, description, location, date, start_time, end_time, or uid.
+# Values provided in a custom event override values inherited from its template.
+templates:
+  example_lab:
+    title: "LAB - Example course"
+    location: "room 101"
+    start_time: "08:15"
+    end_time: "10:00"
+
+# Remove matching source events.
+# At least one selector is required: match, date, or start_time.
+# Selectors may be combined to narrow the match.
+# Example:
+#   - match: "Unwanted lecture"
+#     date: "2026-11-04"
+#     start_time: "14:15"
+drop:
+  - match: "Unwanted course"
+
+# Remove a source event on one specific date.
+# date is required; match and start_time are optional narrowing selectors.
+# Example:
+#   - match: "LAB - Course name"
+#     date: "2026-11-04"
+#     start_time: "14:15"
+cancel:
+  - match: "LECTURE - Example course"
+    date: "2026-11-18"
+
+# Change the start and/or end time of matching source events.
+# Available selectors: match, date, filter_start_time.
+# At least one output field is required: start_time or end_time.
+# Example:
+#   - match: "LAB - Course name"
+#     date: "2026-11-18"
+#     filter_start_time: "14:15"
+#     start_time: "14:30"
+#     end_time: "18:00"
+override:
+  - match: "LAB - Example course"
+    filter_start_time: "08:00"
+    start_time: "08:15"
+    end_time: "10:00"
+
+# Add events that are missing from the source calendar.
+# Required fields after template expansion: title, date, start_time, end_time.
+# Optional fields: description, location, uid, template.
+# Entries may override values inherited from their template.
+# A custom event can also be written without a template:
+#   - title: "Office hours"
+#     description: "Exam preparation"
+#     location: "room 101"
+#     date: "2026-11-20"
+#     start_time: "12:00"
+#     end_time: "13:00"
+#     uid: "office-hours-2026-11-20@example.org" # optional stable UID
+custom:
+  - template: example_lab
+    description: "Exercise 1"
+    date: "2026-11-06"
+
+  - template: example_lab
+    description: "Exercise 2"
+    location: "room 202"
+    date: "2026-11-20"

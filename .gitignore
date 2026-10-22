@@ -1,0 +1,17 @@
+# Environment and secrets
+.env
+*.ics
+rules.yaml
+config.local/
+
+# Logs and runtime artifacts
+*.log
+cron.log
+raw_schedule.ics
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Virtual environment (if used)
+venv/
+.venv/
