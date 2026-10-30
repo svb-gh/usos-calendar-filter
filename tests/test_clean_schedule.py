@@ -1,5 +1,6 @@
 import copy
 import datetime
+import json
 import os
 import stat
 import tempfile
@@ -255,6 +256,153 @@ class CalendarTests(unittest.TestCase):
             clean_schedule.write_calendar_atomic(calendar, output)
 
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o644)
+
+
+class SourceSnapshotTests(unittest.TestCase):
+    @staticmethod
+    def calendar_with(*events: Event) -> Calendar:
+        calendar = Calendar()
+        calendar.add("prodid", "-//source-test//EN")
+        calendar.add("version", "2.0")
+        for event in events:
+            calendar.add_component(event)
+        return calendar
+
+    @staticmethod
+    def event(uid: str, title: str = "Test") -> Event:
+        event = make_event(title=title)
+        event["uid"] = uid
+        return event
+
+    def test_compares_added_removed_and_modified_events(self) -> None:
+        previous = self.calendar_with(
+            self.event("unchanged@example.test"),
+            self.event("modified@example.test", "Old title"),
+            self.event("removed@example.test"),
+        )
+        current = self.calendar_with(
+            self.event("unchanged@example.test"),
+            self.event("modified@example.test", "New title"),
+            self.event("added@example.test"),
+        )
+
+        self.assertEqual(
+            clean_schedule.compare_source_calendars(previous, current),
+            {"added": 1, "removed": 1, "modified": 1},
+        )
+
+    def test_ignores_volatile_source_metadata(self) -> None:
+        before = self.event("same@example.test")
+        before.add("dtstamp", datetime.datetime(2026, 10, 1, tzinfo=UTC))
+        before.add("sequence", 1)
+        after = copy.deepcopy(before)
+        after["dtstamp"] = datetime.datetime(2026, 10, 2, tzinfo=UTC)
+        after["sequence"] = 2
+
+        self.assertEqual(
+            clean_schedule.compare_source_calendars(
+                self.calendar_with(before), self.calendar_with(after)
+            ),
+            {"added": 0, "removed": 0, "modified": 0},
+        )
+
+    def test_change_report_contains_no_event_details_or_counts(self) -> None:
+        previous = self.calendar_with(self.event("event@example.test", "Private old title"))
+        current = self.calendar_with(self.event("event@example.test", "Private new title"))
+        counts = clean_schedule.compare_source_calendars(previous, current)
+
+        report = clean_schedule.source_change_report(previous, current, counts)
+
+        self.assertEqual(set(report), {"schema", "id", "added", "removed", "modified"})
+        self.assertEqual(report["schema"], 1)
+        self.assertFalse(report["added"])
+        self.assertFalse(report["removed"])
+        self.assertTrue(report["modified"])
+        self.assertNotIn("Private", json.dumps(report))
+
+    def test_process_establishes_baseline_then_reports_change(self) -> None:
+        first_source = self.calendar_with(self.event("event@example.test", "Original"))
+        changed_source = self.calendar_with(self.event("event@example.test", "Changed"))
+        semester_start = datetime.datetime(2026, 10, 1, tzinfo=WARSAW)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "public" / "calendar.ics"
+            history = Path(directory) / "state" / "history.ics"
+            source = history.with_name(clean_schedule.SOURCE_SNAPSHOT_FILENAME)
+            report = history.with_name(clean_schedule.SOURCE_CHANGE_REPORT_FILENAME)
+            with (
+                patch("clean_schedule.load_rules", return_value={}),
+                patch(
+                    "clean_schedule.fetch_raw_calendar",
+                    side_effect=[first_source, changed_source, changed_source],
+                ),
+                patch(
+                    "clean_schedule.determine_semester_start",
+                    return_value=semester_start,
+                ),
+            ):
+                baseline_counts = clean_schedule.process_calendar(
+                    "https://example.test/calendar.ics", "rules.yaml", output, history
+                )
+                self.assertTrue(source.exists())
+                self.assertFalse(report.exists())
+                self.assertEqual(baseline_counts["source_changed"], 0)
+
+                changed_counts = clean_schedule.process_calendar(
+                    "https://example.test/calendar.ics", "rules.yaml", output, history
+                )
+                self.assertEqual(changed_counts["source_changed"], 1)
+                report_contents = report.read_text(encoding="utf-8")
+                self.assertEqual(
+                    set(json.loads(report_contents)),
+                    {"schema", "id", "added", "removed", "modified"},
+                )
+                source_event = Calendar.from_ical(source.read_bytes()).walk("VEVENT")[0]
+                self.assertEqual(str(source_event["summary"]), "Changed")
+                self.assertIn("Sala: 101", str(source_event["description"]))
+                self.assertNotIn(clean_schedule.EVENT_SOURCE_PROPERTY, source_event)
+
+                unchanged_counts = clean_schedule.process_calendar(
+                    "https://example.test/calendar.ics", "rules.yaml", output, history
+                )
+                self.assertEqual(unchanged_counts["source_changed"], 0)
+                self.assertEqual(report.read_text(encoding="utf-8"), report_contents)
+
+    def test_failed_public_write_does_not_advance_source_baseline(self) -> None:
+        first_source = self.calendar_with(self.event("event@example.test", "Original"))
+        changed_source = self.calendar_with(self.event("event@example.test", "Changed"))
+        semester_start = datetime.datetime(2026, 10, 1, tzinfo=WARSAW)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "public" / "calendar.ics"
+            history = Path(directory) / "state" / "history.ics"
+            source = history.with_name(clean_schedule.SOURCE_SNAPSHOT_FILENAME)
+            report = history.with_name(clean_schedule.SOURCE_CHANGE_REPORT_FILENAME)
+            clean_schedule.write_calendar_atomic(first_source, source)
+            real_atomic_write = clean_schedule.write_calendar_atomic
+
+            def fail_public_write(calendar: Calendar, path: str | Path) -> None:
+                if Path(path).resolve() == output.resolve():
+                    raise OSError("simulated public write failure")
+                real_atomic_write(calendar, path)
+
+            with (
+                patch("clean_schedule.load_rules", return_value={}),
+                patch("clean_schedule.fetch_raw_calendar", return_value=changed_source),
+                patch(
+                    "clean_schedule.determine_semester_start",
+                    return_value=semester_start,
+                ),
+                patch("clean_schedule.write_calendar_atomic", side_effect=fail_public_write),
+                self.assertRaisesRegex(OSError, "simulated public write failure"),
+            ):
+                clean_schedule.process_calendar(
+                    "https://example.test/calendar.ics", "rules.yaml", output, history
+                )
+
+            source_event = Calendar.from_ical(source.read_bytes()).walk("VEVENT")[0]
+            self.assertEqual(str(source_event["summary"]), "Original")
+            self.assertFalse(report.exists())
 
 
 class HistoryTests(unittest.TestCase):

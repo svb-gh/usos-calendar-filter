@@ -35,6 +35,8 @@ Copy `.env.example` to `.env` and set your private USOS feed URL:
 USOS_ICAL_URL="https://apps.usos.pw.edu.pl/services/tt/upcoming_ical?..."
 OUTPUT_ICS_PATH="/var/www/calendar/cleaned_schedule.ics"
 HISTORY_ICS_PATH="/var/lib/uni-schedule/history.ics"
+SOURCE_SNAPSHOT_ICS_PATH="/var/lib/uni-schedule/source.ics"
+SOURCE_CHANGE_REPORT_PATH="/var/lib/uni-schedule/source-changes.json"
 RULES_FILE_PATH="rules.yaml"
 SUMMER_BREAK_SEARCH_START="01-20"
 SUMMER_SEMESTER_HARD_START="03-15"
@@ -100,6 +102,26 @@ On the first run after upgrading, if the history file does not exist, the progra
 imports available history from the previous public output file. Events that are absent
 from both USOS and that output file cannot be recovered. Keep `HISTORY_ICS_PATH` on a
 persistent disk or volume.
+
+## Original USOS feed monitoring
+
+After every successful refresh, the application privately stores the untouched USOS feed
+and compares it with the previous successful download. The first run silently establishes
+a baseline. Later runs detect any added, removed, or meaningfully changed source event.
+Volatile source metadata such as generation timestamps and sequence counters is ignored.
+
+The raw snapshot defaults to `source.ics` beside `HISTORY_ICS_PATH`. When a change is
+detected, the application writes an anonymous `source-changes.json` report in the same
+directory. The report contains only a deterministic transition identifier and three
+booleans indicating whether something was added, removed, or modified. It never contains
+event names, rooms, dates, counts, or feed contents. An unchanged run does not replace the
+latest change report, allowing an external notifier to retry delivery without repeatedly
+reporting the same transition.
+
+`SOURCE_SNAPSHOT_ICS_PATH` and `SOURCE_CHANGE_REPORT_PATH` may override the derived paths.
+Both files are private persistent state: never serve or commit them. The new snapshot is
+replaced atomically only after the filtered history and public calendar have been written
+successfully, so a failed refresh does not silently advance the comparison baseline.
 
 ## Rules
 
@@ -201,5 +223,5 @@ ruff check .
 ```
 
 The test suite covers event filtering and cancellation, UTC-to-Warsaw time conversion,
-daylight-saving offsets, time overrides, stable UIDs, `VTIMEZONE` preservation, and
-atomic ICS writes.
+daylight-saving offsets, time overrides, stable UIDs, `VTIMEZONE` preservation, original
+source-feed comparison, private change reports, and atomic ICS writes.

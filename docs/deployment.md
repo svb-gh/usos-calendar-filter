@@ -18,7 +18,8 @@ Deployments must keep these resources outside versioned application releases:
 
 - secrets and environment configuration;
 - private calendar rules;
-- retained calendar history and other state;
+- retained calendar history, untouched source snapshots, anonymous source-change reports,
+  and other state;
 - generated public ICS output.
 
 Replacing application code must not delete or silently reset any persistent resource.
