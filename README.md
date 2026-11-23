@@ -35,8 +35,6 @@ Copy `.env.example` to `.env` and set your private USOS feed URL:
 USOS_ICAL_URL="https://apps.usos.pw.edu.pl/services/tt/upcoming_ical?..."
 OUTPUT_ICS_PATH="/var/www/calendar/cleaned_schedule.ics"
 HISTORY_ICS_PATH="/var/lib/uni-schedule/history.ics"
-SOURCE_SNAPSHOT_ICS_PATH="/var/lib/uni-schedule/source.ics"
-SOURCE_CHANGE_REPORT_PATH="/var/lib/uni-schedule/source-changes.json"
 RULES_FILE_PATH="rules.yaml"
 SUMMER_BREAK_SEARCH_START="01-20"
 SUMMER_SEMESTER_HARD_START="03-15"
@@ -88,11 +86,12 @@ from the current semester. Older events are removed automatically. The state fil
 the public calendar are both replaced atomically.
 
 The winter semester always starts on October 1. For the summer semester, the program
-looks for breaks of at least `MIN_SEMESTER_BREAK_DAYS` between USOS events, beginning
+looks for breaks of at least `MIN_SEMESTER_BREAK_DAYS` in the original USOS activity, beginning
 at `SUMMER_BREAK_SEARCH_START`. It selects the longest qualifying break only when
-regular activity follows, ignoring custom events during detection. If multiple breaks
-have the same length, the later one wins. The detected date is stored inside the
-private history calendar and reused on subsequent runs.
+regular activity follows. If multiple breaks have the same length, the later one wins.
+Filtering rules leave the detection input unchanged. The private history file retains past
+USOS activity dates for this calculation, so classes that disappear from the feed can
+still establish the start of a break. The detected date is reused on subsequent runs.
 
 If no reliable break is detected by `SUMMER_SEMESTER_HARD_START`, that date becomes the
 semester boundary. The defaults search from January 20, require a 14-day break, and
@@ -102,26 +101,6 @@ On the first run after upgrading, if the history file does not exist, the progra
 imports available history from the previous public output file. Events that are absent
 from both USOS and that output file cannot be recovered. Keep `HISTORY_ICS_PATH` on a
 persistent disk or volume.
-
-## Original USOS feed monitoring
-
-After every successful refresh, the application privately stores the untouched USOS feed
-and compares it with the previous successful download. The first run silently establishes
-a baseline. Later runs detect any added, removed, or meaningfully changed source event.
-Volatile source metadata such as generation timestamps and sequence counters is ignored.
-
-The raw snapshot defaults to `source.ics` beside `HISTORY_ICS_PATH`. When a change is
-detected, the application writes an anonymous `source-changes.json` report in the same
-directory. The report contains only a deterministic transition identifier and three
-booleans indicating whether something was added, removed, or modified. It never contains
-event names, rooms, dates, counts, or feed contents. An unchanged run does not replace the
-latest change report, allowing an external notifier to retry delivery without repeatedly
-reporting the same transition.
-
-`SOURCE_SNAPSHOT_ICS_PATH` and `SOURCE_CHANGE_REPORT_PATH` may override the derived paths.
-Both files are private persistent state: never serve or commit them. The new snapshot is
-replaced atomically only after the filtered history and public calendar have been written
-successfully, so a failed refresh does not silently advance the comparison baseline.
 
 ## Rules
 
@@ -214,6 +193,19 @@ used by the default `HISTORY_ICS_PATH`. The service user must also have write ac
 the directory configured by `OUTPUT_ICS_PATH`. Keep the environment file readable only
 by the service administrator because it contains the private USOS URL.
 
+## Check the published calendar
+
+On an independent monitoring host, set `PUBLISHED_ICS_URL` to the URL used by calendar
+subscribers. Run the check on a schedule and alert on a nonzero exit status:
+
+```bash
+usos-calendar-filter --check-published --max-age-hours 12
+```
+
+The check downloads and parses the ICS and verifies its HTTP `Last-Modified` header.
+The default age limit is 12 hours. Adjust it to allow for the longest gap between
+scheduled refreshes. Configure the HTTP server to send the file's modification time.
+
 ## Tests and code quality
 
 ```bash
@@ -223,5 +215,4 @@ ruff check .
 ```
 
 The test suite covers event filtering and cancellation, UTC-to-Warsaw time conversion,
-daylight-saving offsets, time overrides, stable UIDs, `VTIMEZONE` preservation, original
-source-feed comparison, private change reports, and atomic ICS writes.
+daylight-saving offsets, time overrides, stable UIDs, `VTIMEZONE` preservation, semester detection, and atomic ICS writes.

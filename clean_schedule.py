@@ -1,15 +1,15 @@
+import argparse
 import copy
 import datetime
-import hashlib
 import itertools
-import json
 import os
 import re
 import stat
 import tempfile
 import uuid
 import zoneinfo
-from collections import Counter
+from collections.abc import Iterable
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import icalendar
@@ -23,8 +23,6 @@ from urllib3.util.retry import Retry
 DEFAULT_RULES_FILE_PATH = "rules.yaml"
 DEFAULT_OUTPUT_ICS_PATH = "/var/www/calendar/cleaned_schedule.ics"
 DEFAULT_HISTORY_ICS_PATH = "/var/lib/uni-schedule/history.ics"
-SOURCE_SNAPSHOT_FILENAME = "source.ics"
-SOURCE_CHANGE_REPORT_FILENAME = "source-changes.json"
 WINTER_SEMESTER_START = (10, 1)
 DEFAULT_SUMMER_BREAK_SEARCH_START = "01-20"
 DEFAULT_SUMMER_SEMESTER_HARD_START = "03-15"
@@ -34,6 +32,7 @@ LOCAL_TIMEZONE = zoneinfo.ZoneInfo("Europe/Warsaw")
 CUSTOM_UID_NAMESPACE = uuid.UUID("726fc3f2-d8d4-4c86-8a34-e88ef1e74093")
 EVENT_SOURCE_PROPERTY = "x-uni-schedule-source"
 SEMESTER_START_PROPERTY = "x-uni-schedule-semester-start"
+SOURCE_ACTIVITY_DATES_PROPERTY = "x-uni-schedule-source-activity-dates"
 
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 GROUP_REGEX = re.compile(r"[?&]gr_nr=(\d+)", re.IGNORECASE)
@@ -41,7 +40,6 @@ TIME_FORMAT = "%H:%M"
 DATE_FORMAT = "%Y-%m-%d"
 RULE_LIST_SECTIONS = {"drop", "cancel", "override", "custom"}
 RULE_SECTIONS = RULE_LIST_SECTIONS | {"templates"}
-VOLATILE_SOURCE_EVENT_FIELDS = {"CREATED", "DTSTAMP", "LAST-MODIFIED", "SEQUENCE"}
 RULE_FIELDS = {
     "drop": {"match", "date", "start_time"},
     "cancel": {"match", "date", "start_time"},
@@ -252,6 +250,38 @@ def fetch_raw_calendar(url: str) -> Calendar:
         except requests.RequestException:
             raise CalendarFetchError("Could not download the calendar feed.") from None
         return Calendar.from_ical(response.content)
+
+
+def check_published_calendar(
+    url: str, max_age: datetime.timedelta, now: datetime.datetime | None = None
+) -> None:
+    """Check the calendar as served to a subscriber, including HTTP freshness."""
+    try:
+        response = requests.get(url, headers={"Cache-Control": "no-cache"}, timeout=(10, 30))
+        response.raise_for_status()
+    except requests.RequestException:
+        raise CalendarFetchError("Could not download the published calendar.") from None
+
+    try:
+        calendar = Calendar.from_ical(response.content)
+    except ValueError:
+        raise CalendarFetchError("The published feed is not a valid calendar.") from None
+    if (
+        calendar.name != "VCALENDAR"
+        or "VERSION" not in calendar
+        or any(component.errors for component in calendar.walk())
+    ):
+        raise CalendarFetchError("The published feed is not a valid calendar.")
+
+    try:
+        modified = parsedate_to_datetime(response.headers.get("Last-Modified", ""))
+        if modified.tzinfo is None:
+            raise ValueError
+    except ValueError:
+        raise CalendarFetchError("The published feed has no valid Last-Modified header.") from None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if now - modified > max_age:
+        raise CalendarFetchError("The published feed is older than the configured limit.")
 
 
 def _event_start_local(event: Event) -> datetime.datetime | None:
@@ -476,69 +506,6 @@ def _event_identity(event: Event) -> tuple[str, ...]:
     )
 
 
-def _source_event_fingerprint(event: Event) -> str:
-    """Return a stable digest of meaningful source-event data."""
-    normalized = copy.deepcopy(event)
-    for field in VOLATILE_SOURCE_EVENT_FIELDS:
-        normalized.pop(field, None)
-    return hashlib.sha256(normalized.to_ical(sorted=True)).hexdigest()
-
-
-def _source_event_groups(calendar: Calendar) -> dict[tuple[str, ...], Counter[str]]:
-    groups: dict[tuple[str, ...], Counter[str]] = {}
-    for event in calendar.walk("VEVENT"):
-        identity = _event_identity(event)
-        groups.setdefault(identity, Counter())[_source_event_fingerprint(event)] += 1
-    return groups
-
-
-def compare_source_calendars(previous: Calendar, current: Calendar) -> dict[str, int]:
-    """Count added, removed, and meaningfully modified source events."""
-    previous_groups = _source_event_groups(previous)
-    current_groups = _source_event_groups(current)
-    counts = {"added": 0, "removed": 0, "modified": 0}
-    for identity in previous_groups.keys() | current_groups.keys():
-        before = previous_groups.get(identity, Counter())
-        after = current_groups.get(identity, Counter())
-        unchanged = before & after
-        before_remaining = before - unchanged
-        after_remaining = after - unchanged
-        before_count = sum(before_remaining.values())
-        after_count = sum(after_remaining.values())
-        modified = min(before_count, after_count)
-        counts["modified"] += modified
-        counts["removed"] += before_count - modified
-        counts["added"] += after_count - modified
-    return counts
-
-
-def _source_calendar_digest(calendar: Calendar) -> str:
-    records = []
-    for identity, fingerprints in _source_event_groups(calendar).items():
-        for fingerprint, count in fingerprints.items():
-            records.append([list(identity), fingerprint, count])
-    encoded = json.dumps(sorted(records), separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def source_change_report(
-    previous: Calendar, current: Calendar, counts: dict[str, int]
-) -> dict[str, str | int | bool]:
-    """Build an anonymous, deterministic report for a source-calendar transition."""
-    if not any(counts.values()):
-        raise ValueError("A source change report requires at least one changed event.")
-    previous_digest = _source_calendar_digest(previous)
-    current_digest = _source_calendar_digest(current)
-    transition_id = hashlib.sha256(f"{previous_digest}:{current_digest}".encode()).hexdigest()
-    return {
-        "schema": 1,
-        "id": transition_id,
-        "added": counts["added"] > 0,
-        "removed": counts["removed"] > 0,
-        "modified": counts["modified"] > 0,
-    }
-
-
 def _parse_month_day(value: str, field: str) -> tuple[int, int]:
     if not isinstance(value, str) or not re.fullmatch(r"\d{2}-\d{2}", value):
         raise ValueError(f"{field} must use MM-DD format.")
@@ -558,18 +525,24 @@ def _as_local_datetime(value: datetime.datetime | None = None) -> datetime.datet
     return value.astimezone(LOCAL_TIMEZONE)
 
 
-def _source_event_dates(*calendars: Calendar | None) -> list[datetime.date]:
+def _source_event_dates(calendar: Calendar | None, *, raw: bool = False) -> set[datetime.date]:
+    if calendar is None:
+        return set()
     dates = set()
-    for calendar in calendars:
-        if calendar is None:
+    for event in calendar.walk("VEVENT"):
+        if not raw and str(event.get(EVENT_SOURCE_PROPERTY, "")).upper() != "USOS":
             continue
-        for event in calendar.walk("VEVENT"):
-            if str(event.get(EVENT_SOURCE_PROPERTY, "")).upper() != "USOS":
-                continue
-            start = _event_start_local(event)
-            if start is not None:
-                dates.add(start.date())
-    return sorted(dates)
+        start = _event_start_local(event)
+        if start is not None:
+            dates.add(start.date())
+    return dates
+
+
+def _previous_source_dates(history: Calendar | None) -> set[datetime.date]:
+    if history is None or SOURCE_ACTIVITY_DATES_PROPERTY not in history:
+        return _source_event_dates(history)
+    stored = str(history[SOURCE_ACTIVITY_DATES_PROPERTY])
+    return {datetime.date.fromisoformat(date) for date in stored.split(",") if date}
 
 
 def _stored_semester_start(calendar: Calendar | None) -> datetime.date | None:
@@ -588,6 +561,8 @@ def determine_semester_start(
     summer_search_start: str = DEFAULT_SUMMER_BREAK_SEARCH_START,
     summer_hard_start: str = DEFAULT_SUMMER_SEMESTER_HARD_START,
     min_break_days: int = DEFAULT_MIN_SEMESTER_BREAK_DAYS,
+    *,
+    activity_dates: Iterable[datetime.date] | None = None,
 ) -> datetime.datetime:
     """Determine the semester boundary from a fixed winter date or a winter break."""
     if min_break_days < 1:
@@ -609,7 +584,9 @@ def determine_semester_start(
     if stored_start is not None and search_date <= stored_start <= hard_date:
         return datetime.datetime.combine(stored_start, datetime.time.min, LOCAL_TIMEZONE)
 
-    source_dates = _source_event_dates(previous, current)
+    if activity_dates is None:
+        activity_dates = _source_event_dates(current) | _previous_source_dates(previous)
+    source_dates = sorted(set(activity_dates))
     january_first = datetime.date(now_local.year, 1, 1)
     candidates: list[tuple[int, datetime.date]] = []
     for before, after in itertools.pairwise(source_dates):
@@ -622,8 +599,8 @@ def determine_semester_start(
         ):
             continue
         activity_end = after + datetime.timedelta(days=14)
-        activity_dates = sum(after <= date <= activity_end for date in source_dates)
-        if activity_dates >= MIN_SUMMER_ACTIVITY_DATES:
+        activity_count = sum(after <= date <= activity_end for date in source_dates)
+        if activity_count >= MIN_SUMMER_ACTIVITY_DATES:
             candidates.append((gap_days, after))
 
     if candidates:
@@ -706,19 +683,6 @@ def load_previous_calendar(calendar_path: str | Path) -> Calendar | None:
         return None
 
 
-def load_source_snapshot(calendar_path: str | Path) -> Calendar | None:
-    """Load the previous untouched source calendar, failing on corrupt state."""
-    calendar_file = Path(calendar_path)
-    if not calendar_file.exists():
-        return None
-    try:
-        return Calendar.from_ical(calendar_file.read_bytes())
-    except (OSError, ValueError) as exc:
-        raise ValueError(
-            f"Could not read source calendar snapshot '{calendar_file}': {type(exc).__name__}."
-        ) from None
-
-
 def write_calendar_atomic(calendar: Calendar, output_path: str | Path) -> None:
     """Atomically replace the output so readers never see a partial ICS file."""
     output_file = Path(output_path)
@@ -744,43 +708,11 @@ def write_calendar_atomic(calendar: Calendar, output_path: str | Path) -> None:
             temporary_path.unlink()
 
 
-def write_json_atomic(value: dict, output_path: str | Path) -> None:
-    """Atomically write private machine-readable state without exposing partial JSON."""
-    output_file = Path(output_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        existing_mode = stat.S_IMODE(output_file.stat().st_mode)
-    except FileNotFoundError:
-        existing_mode = None
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=output_file.parent,
-            prefix=f".{output_file.name}.",
-            delete=False,
-        ) as handle:
-            temporary_path = Path(handle.name)
-            json.dump(value, handle, sort_keys=True, separators=(",", ":"))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        if existing_mode is not None:
-            temporary_path.chmod(existing_mode)
-        os.replace(temporary_path, output_file)
-    finally:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
-
-
 def process_calendar(
     url: str,
     rules_path: str | Path,
     output_path: str | Path,
     history_path: str | Path = DEFAULT_HISTORY_ICS_PATH,
-    source_snapshot_path: str | Path | None = None,
-    source_change_report_path: str | Path | None = None,
     summer_break_search_start: str = DEFAULT_SUMMER_BREAK_SEARCH_START,
     summer_semester_hard_start: str = DEFAULT_SUMMER_SEMESTER_HARD_START,
     min_semester_break_days: int = DEFAULT_MIN_SEMESTER_BREAK_DAYS,
@@ -789,43 +721,28 @@ def process_calendar(
     rules = load_rules(rules_path)
     history_file = Path(history_path).resolve()
     output_file = Path(output_path).resolve()
-    source_file = (
-        Path(source_snapshot_path).resolve()
-        if source_snapshot_path is not None
-        else history_file.with_name(SOURCE_SNAPSHOT_FILENAME)
-    )
-    source_report_file = (
-        Path(source_change_report_path).resolve()
-        if source_change_report_path is not None
-        else history_file.with_name(SOURCE_CHANGE_REPORT_FILENAME)
-    )
-    if source_file in {history_file, output_file, source_report_file} or source_report_file in {
-        history_file,
-        output_file,
-    }:
-        raise ValueError("Source snapshot and report paths must not replace calendar files.")
-
     previous_cal = load_previous_calendar(history_file)
     if previous_cal is None and history_file != output_file:
         previous_cal = load_previous_calendar(output_file)
         if previous_cal is not None:
             print("Migrating calendar history from the previous output file...")
-    previous_source = load_source_snapshot(source_file)
     print("Fetching calendar feed from USOS...")
     raw_cal = fetch_raw_calendar(url)
-    source_counts = (
-        compare_source_calendars(previous_source, raw_cal)
-        if previous_source is not None
-        else {"added": 0, "removed": 0, "modified": 0}
-    )
-    source_changed = any(source_counts.values())
     new_cal, counts = build_calendar(raw_cal, rules)
+    now = _as_local_datetime()
+    activity_dates = {
+        date
+        for date in _source_event_dates(raw_cal, raw=True) | _previous_source_dates(previous_cal)
+        if date.year == now.year and (date.month, date.day) < WINTER_SEMESTER_START
+    }
     semester_start = determine_semester_start(
         new_cal,
         previous_cal,
+        now=now,
         summer_search_start=summer_break_search_start,
         summer_hard_start=summer_semester_hard_start,
         min_break_days=min_semester_break_days,
+        activity_dates=activity_dates,
     )
     new_cal[SEMESTER_START_PROPERTY] = semester_start.date().isoformat()
     counts.update(
@@ -833,6 +750,7 @@ def process_calendar(
             new_cal,
             previous_cal,
             semester_start=semester_start,
+            now=now,
             rules=rules,
         )
     )
@@ -849,26 +767,35 @@ def process_calendar(
         if counts[key]:
             print(f"{label} {counts[key]} event(s).")
 
-    write_calendar_atomic(new_cal, history_file)
     if history_file != output_file:
-        write_calendar_atomic(new_cal, output_file)
-    if previous_source is not None and source_changed:
-        write_json_atomic(
-            source_change_report(previous_source, raw_cal, source_counts),
-            source_report_file,
+        history = copy.deepcopy(new_cal)
+        history[SOURCE_ACTIVITY_DATES_PROPERTY] = ",".join(
+            date.isoformat() for date in sorted(activity_dates) if date <= now.date()
         )
-    write_calendar_atomic(raw_cal, source_file)
-    counts["source_changed"] = int(source_changed)
-    if previous_source is None:
-        print("Stored the initial untouched USOS calendar snapshot.")
-    elif source_changed:
-        print("The untouched USOS calendar changed since the previous successful run.")
+        write_calendar_atomic(history, history_file)
+    write_calendar_atomic(new_cal, output_file)
     print(f"Calendar successfully updated and written to {output_path}.")
     return counts
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check-published", action="store_true", help="check the served ICS feed")
+    parser.add_argument("--max-age-hours", type=int, default=12, help="published feed age limit")
+    args = parser.parse_args()
     load_dotenv()
+    if args.check_published:
+        published_url = os.getenv("PUBLISHED_ICS_URL")
+        if not published_url:
+            parser.error("Set PUBLISHED_ICS_URL to the calendar subscription URL.")
+        if args.max_age_hours < 1:
+            parser.error("--max-age-hours must be positive.")
+        try:
+            check_published_calendar(published_url, datetime.timedelta(hours=args.max_age_hours))
+        except CalendarFetchError as exc:
+            parser.exit(1, f"{exc}\n")
+        print("The published calendar is reachable, valid, and fresh.")
+        return
     url = os.getenv("USOS_ICAL_URL")
     if not url:
         raise ValueError("USOS_ICAL_URL is not configured. Set it in .env or the environment.")
@@ -883,8 +810,6 @@ def main() -> None:
         rules_path=os.getenv("RULES_FILE_PATH", DEFAULT_RULES_FILE_PATH),
         output_path=os.getenv("OUTPUT_ICS_PATH", DEFAULT_OUTPUT_ICS_PATH),
         history_path=os.getenv("HISTORY_ICS_PATH", DEFAULT_HISTORY_ICS_PATH),
-        source_snapshot_path=os.getenv("SOURCE_SNAPSHOT_ICS_PATH") or None,
-        source_change_report_path=os.getenv("SOURCE_CHANGE_REPORT_PATH") or None,
         summer_break_search_start=os.getenv(
             "SUMMER_BREAK_SEARCH_START", DEFAULT_SUMMER_BREAK_SEARCH_START
         ),

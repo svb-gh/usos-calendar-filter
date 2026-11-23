@@ -10,16 +10,13 @@ Code and private configuration use separate update channels:
 - The `main` branch is for development and must not be pulled directly into production.
 - Private rules may be updated independently from the private configuration repository after validation.
 
-The production updater described below is the target design. It is not active until the server-specific operations document records that the initial migration has completed.
-
 ## Persistent boundaries
 
 Deployments must keep these resources outside versioned application releases:
 
 - secrets and environment configuration;
 - private calendar rules;
-- retained calendar history, untouched source snapshots, anonymous source-change reports,
-  and other state;
+- retained calendar history and other state;
 - generated public ICS output.
 
 Replacing application code must not delete or silently reset any persistent resource.
@@ -28,17 +25,18 @@ Replacing application code must not delete or silently reset any persistent reso
 
 An automated updater should:
 
-1. Acquire a lock so calendar generation and another deployment cannot overlap.
+1. Acquire a lock so two deployments cannot overlap.
 2. Fetch the selected immutable application tag and the private configuration revision.
 3. Prepare a new release directory without modifying the active release.
 4. Create a fresh virtual environment and install the declared dependencies.
-5. Validate the private rules and run automated tests or an equivalent smoke test.
+5. Validate the private rules and run a full calendar refresh against the candidate using
+   disposable copies of the live history and output.
 6. Back up affected persistent state and apply every pending versioned migration.
-7. Atomically switch the active-release pointer.
-8. Restart or reload only the required services and verify a successful calendar run.
-9. Roll back the active-release pointer if verification fails.
+7. Atomically switch a single pointer to the verified application release and rules revision.
+8. Verify the next scheduled or manual refresh and the served feed.
 
 A failed fetch, installation, validation, migration, or smoke test must leave the previous release and configuration active.
+Keep the previous verified deployment available so an administrator can restore the pair together.
 
 ## Migrations
 
